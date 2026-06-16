@@ -12,6 +12,7 @@ from erpnext.accounts.doctype.sales_invoice.mapper import (
 	create_dunning as create_dunning_from_sales_invoice,
 )
 from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import (
+	create_sales_invoice,
 	create_sales_invoice_against_cost_center,
 )
 from erpnext.tests.utils import ERPNextTestSuite
@@ -151,6 +152,104 @@ class TestDunning(ERPNextTestSuite):
 		credit_note.cancel()
 		dunning.reload()
 		self.assertEqual(dunning.status, "Unresolved")
+
+	@ERPNextTestSuite.change_settings(
+		"Accounts Settings", {"allow_multi_currency_invoices_against_single_party_account": 1}
+	)
+	def test_dunning_outstanding_in_transaction_currency(self):
+		"""
+		When party_account_currency != currency (USD invoice against INR/company-currency receivable),
+		overdue_payments[0].outstanding must be the transaction-currency amount, not outstanding_amount
+		(which is stored in party account currency). Regression guard for the fix to #41817 extension.
+		"""
+		# USD invoice booked against the INR (company-currency) debtors account.
+		# party_account_currency=INR, currency=USD → outstanding_amount stored in INR.
+		si = create_sales_invoice(
+			currency="USD",
+			conversion_rate=50,
+			rate=100,
+			qty=1,
+			debit_to="Debtors - _TC",
+			posting_date=add_days(today(), -10),
+		)
+
+		dunning = create_dunning_from_sales_invoice(si.name)
+
+		self.assertEqual(dunning.currency, "USD")
+		# outstanding on the dunning row must be in USD (transaction currency).
+		self.assertEqual(
+			round(dunning.overdue_payments[0].outstanding, 2),
+			round(si.payment_schedule[0].outstanding, 2),
+		)
+		# Must NOT be the INR outstanding_amount painted as USD.
+		self.assertNotEqual(
+			round(dunning.overdue_payments[0].outstanding, 2),
+			round(si.outstanding_amount, 2),
+		)
+		self.assertEqual(
+			round(dunning.total_outstanding, 2),
+			round(si.payment_schedule[0].outstanding, 2),
+		)
+
+	def test_dunning_outstanding_same_currency_no_regression(self):
+		"""
+		When party_account_currency == currency (same-currency invoice), outstanding_amount
+		is used directly — ensures no regression of the original #41817 fix.
+		"""
+		si = create_sales_invoice_against_cost_center(posting_date=add_days(today(), -10), qty=1, rate=100)
+		dunning = create_dunning_from_sales_invoice(si.name)
+
+		self.assertEqual(
+			round(dunning.overdue_payments[0].outstanding, 2),
+			round(si.outstanding_amount, 2),
+		)
+
+	@ERPNextTestSuite.change_settings(
+		"Accounts Settings", {"allow_multi_currency_invoices_against_single_party_account": 1}
+	)
+	def test_dunning_multi_installment_foreign_currency(self):
+		"""
+		Multi-row payment schedule + foreign currency: both overdue installments must carry
+		transaction-currency (USD) outstanding amounts, not company-currency values.
+		The postprocess block is skipped entirely for len(payment_schedule) > 1, so the
+		mapper-copied Payment Schedule.outstanding values (already in transaction currency)
+		must be preserved untouched.
+		"""
+		create_payment_terms_template_for_dunning()
+		# Post 11 days ago: term 1 (due day 5) and term 2 (due day 10) are both overdue.
+		# Set the template before insert so the payment schedule is split into two rows.
+		si = create_sales_invoice(
+			currency="USD",
+			conversion_rate=50,
+			rate=200,
+			qty=1,
+			debit_to="Debtors - _TC",
+			posting_date=add_days(today(), -11),
+			do_not_save=True,
+		)
+		si.payment_terms_template = "_Test 50-50 for Dunning"
+		si.insert()
+		si.submit()
+		si.load_from_db()
+
+		dunning = create_dunning_from_sales_invoice(si.name)
+
+		self.assertEqual(dunning.currency, "USD")
+		self.assertEqual(len(dunning.overdue_payments), 2)
+
+		# Build a lookup: payment_schedule row name → outstanding (USD)
+		ps_outstanding = {row.name: row.outstanding for row in si.payment_schedule}
+
+		for op in dunning.overdue_payments:
+			expected_usd = round(ps_outstanding[op.payment_schedule], 2)
+			self.assertEqual(round(op.outstanding, 2), expected_usd)
+			# Must not be the INR outstanding_amount (10000) accidentally stored as USD.
+			self.assertNotEqual(round(op.outstanding, 2), round(si.outstanding_amount, 2))
+
+		self.assertEqual(
+			round(dunning.total_outstanding, 2),
+			round(sum(ps_outstanding.values()), 2),
+		)
 
 	def test_dunning_not_affected_by_standalone_credit_note(self):
 		"""
