@@ -590,11 +590,21 @@ def create_dunning(
 				target.closing_text = letter_text.get("closing_text")
 				target.language = letter_text.get("language")
 
-		# update outstanding from doc
+		# Update outstanding from the invoice.
+		# Sales Invoice.outstanding_amount is in the party account currency, which
+		# may differ from the transaction currency (e.g. a USD invoice booked
+		# against a company-currency receivable account). Overdue Payment.outstanding
+		# is in the transaction currency, so when the currencies differ we must use
+		# Payment Schedule.outstanding (already in transaction currency and kept
+		# current with payments) instead of the party-account outstanding_amount.
 		if source.payment_schedule and len(source.payment_schedule) == 1:
+			if source.party_account_currency and source.party_account_currency != source.currency:
+				outstanding = flt(source.payment_schedule[0].outstanding)
+			else:
+				outstanding = source.get("outstanding_amount")
 			for row in target.overdue_payments:
 				if row.payment_schedule == source.payment_schedule[0].name:
-					row.outstanding = source.get("outstanding_amount")
+					row.outstanding = outstanding
 
 		target.validate()
 
